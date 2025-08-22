@@ -11,6 +11,7 @@ const processedCallbacks = new Set();
 
 // 全局并发锁管理
 const globalLocks = new Map(); // key -> Promise
+const topicCreationLocks = new Map(); // chatId -> Promise (专门用于话题创建)
 
 // 批量写入队列和管理
 const pendingDbWrites = new Map();
@@ -639,10 +640,20 @@ async function createForumTopic(topicName, userName, nickname, userId, d1) {
 }
 
 async function saveTopicId(chatId, topicId, d1) {
-  await d1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-    .bind(chatId, topicId)
-    .run();
-  topicIdCache.set(chatId, topicId);
+  try {
+    // 先写入数据库
+    await d1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
+      .bind(chatId, topicId)
+      .run();
+    
+    // 数据库写入成功后才更新缓存
+    topicIdCache.set(chatId, topicId);
+    
+    console.log(`[SYSTEM] 话题映射保存成功 [${chatId} -> ${topicId}]`);
+  } catch (error) {
+    console.error(`[SYSTEM] 保存话题映射失败 [${chatId} -> ${topicId}]:`, error.message);
+    throw error; // 重新抛出错误，让调用方知道保存失败
+  }
 }
 
 async function getPrivateChatId(topicId, d1) {
@@ -659,12 +670,22 @@ async function getPrivateChatId(topicId, d1) {
 }
 
 async function ensureUserTopic(chatId, userInfo, d1) {
-  // 使用全局锁确保同一用户的topic创建是串行的
-  return await withLock(`topic_creation_${chatId}`, async () => {
+  // 检查是否已经有锁在运行
+  if (topicCreationLocks.has(chatId)) {
+    console.log(`[SYSTEM] 等待已有的话题创建进程 [${chatId}]`);
+    // 直接等待已存在的Promise完成
+    return await topicCreationLocks.get(chatId);
+  }
+
+  // 创建新的话题创建Promise
+  const topicCreationPromise = (async () => {
     try {
+      console.log(`[SYSTEM] 开始话题创建流程 [${chatId}]`);
+      
       // 再次检查是否已存在（防止并发创建）
       let topicId = await getExistingTopicId(chatId, d1);
       if (topicId) {
+        console.log(`[SYSTEM] 发现已存在话题 [${chatId} -> ${topicId}]`);
         return topicId;
       }
 
@@ -673,16 +694,30 @@ async function ensureUserTopic(chatId, userInfo, d1) {
       
       console.log(`[SYSTEM] 为用户创建新topic [${chatId}]: ${nickname}`);
       
+      // 创建话题
       topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId, d1);
+      
+      // 保存话题映射（必须成功才返回）
       await saveTopicId(chatId, topicId, d1);
       
+      console.log(`[SYSTEM] 话题创建完成 [${chatId} -> ${topicId}]`);
       return topicId;
       
     } catch (error) {
       console.error(`[SYSTEM] 创建用户topic失败 [${chatId}]:`, error.message);
       throw error;
+    } finally {
+      // 无论成功失败，都要清理锁
+      topicCreationLocks.delete(chatId);
+      console.log(`[SYSTEM] 话题创建锁已释放 [${chatId}]`);
     }
-  });
+  })();
+
+  // 将Promise存储到锁映射中
+  topicCreationLocks.set(chatId, topicCreationPromise);
+  
+  // 返回Promise结果
+  return await topicCreationPromise;
 }
 
 async function validateTopic(topicId) {
@@ -1086,21 +1121,45 @@ async function onMessage(message, d1) {
     return;
   }
 
-  let topicId = await ensureUserTopic(chatId, userInfo, d1);
-  if (!topicId) {
-    await sendMessageToUser(chatId, "无法创建话题，请稍后再试或联系管理员。");
+  let topicId;
+  try {
+    // 确保话题创建完成并保存后才继续
+    console.log(`[SYSTEM] 准备确保用户话题存在 [${chatId}]`);
+    topicId = await ensureUserTopic(chatId, userInfo, d1);
+    
+    if (!topicId) {
+      await sendMessageToUser(chatId, "无法创建话题，请稍后再试或联系管理员。");
+      return;
+    }
+    
+    console.log(`[SYSTEM] 话题确保完成，准备发送消息 [${chatId} -> ${topicId}]`);
+  } catch (error) {
+    console.error(`[SYSTEM] 确保用户话题失败 [${chatId}]:`, error.message);
+    await sendMessageToUser(chatId, "创建会话失败，请稍后再试或联系管理员。");
     return;
   }
 
+  // 验证话题是否有效
   const isTopicValid = await validateTopic(topicId);
   if (!isTopicValid) {
-    // topic失效，清理缓存并重新创建
-    await d1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
-    topicIdCache.delete(chatId);
+    console.log(`[SYSTEM] 话题失效，重新创建 [${chatId} -> ${topicId}]`);
     
-    topicId = await ensureUserTopic(chatId, userInfo, d1);
-    if (!topicId) {
-      await sendMessageToUser(chatId, "无法重新创建话题，请稍后再试或联系管理员。");
+    try {
+      // topic失效，清理缓存和数据库记录，然后重新创建
+      await d1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
+      topicIdCache.delete(chatId);
+      
+      // 重新创建话题
+      topicId = await ensureUserTopic(chatId, userInfo, d1);
+      if (!topicId) {
+        await sendMessageToUser(chatId, "无法重新创建话题，请稍后再试或联系管理员。");
+        return;
+      }
+      
+      console.log(`[SYSTEM] 话题重新创建完成 [${chatId} -> ${topicId}]`);
+    } catch (error) {
+      console.error(`[SYSTEM] 重新创建话题失败 [${chatId}]:`, error.message);
+      await sendMessageToUser(chatId, "重新创建会话失败，请稍后再试或联系管理员。");
       return;
     }
   }
@@ -1108,13 +1167,18 @@ async function onMessage(message, d1) {
   const userName = userInfo.username || `User_${chatId}`;
   const nickname = userInfo.nickname || userName;
 
+  // 确保话题完全可用后才发送消息
   try {
+    console.log(`[SYSTEM] 开始发送消息到话题 [${chatId} -> ${topicId}]`);
+    
     if (text) {
       const formattedMessage = `${nickname}:\n${text}`;
       await sendMessageToTopic(topicId, formattedMessage);
     } else {
       await copyMessageToTopic(topicId, message);
     }
+    
+    console.log(`[SYSTEM] 消息发送成功 [${chatId} -> ${topicId}]`);
   } catch (error) {
     console.error(`[SYSTEM] 转发消息到topic失败 [${chatId} -> ${topicId}]:`, error.message);
     await sendMessageToUser(chatId, "消息发送失败，请稍后再试。");
